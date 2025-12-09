@@ -1,0 +1,5 @@
+streamlit>=1.24
+pdfplumber>=0.7.6
+fpdf2>=2.7.0
+sumy>=0.10.0
+nltk>=3.8.1
