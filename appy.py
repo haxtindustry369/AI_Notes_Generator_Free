@@ -4,45 +4,67 @@ from fpdf import FPDF
 import pdfplumber
 import streamlit as st
 
-# summarizer
+# -------------------------------------------------------------------
+# NLTK SETUP (fully safe and compatible with Streamlit Cloud)
+# -------------------------------------------------------------------
+import nltk
+
+nltk_packages = ["punkt", "averaged_perceptron_tagger", "wordnet", "omw-1.4"]
+for pkg in nltk_packages:
+    try:
+        if pkg == "punkt":
+            nltk.data.find("tokenizers/punkt")
+        elif pkg == "averaged_perceptron_tagger":
+            nltk.data.find("taggers/averaged_perceptron_tagger")
+        else:
+            nltk.data.find(f"corpora/{pkg}")
+    except LookupError:
+        try:
+            nltk.download(pkg)
+        except:
+            pass  # Streamlit may block sometimes; fallback logic handles it
+
+from nltk import word_tokenize, pos_tag
+from nltk.corpus import wordnet as wn
+
+# -------------------------------------------------------------------
+# SUMMARIZER (Sumy + robust fallback)
+# -------------------------------------------------------------------
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lex_rank import LexRankSummarizer
 
-# nltk for simple POS and resources
-import nltk
-from nltk import word_tokenize, pos_tag
-from nltk.corpus import wordnet as wn
+def simple_summary(text, sentences_count=5):
+    """Fallback summary: first N sentences."""
+    sents = re.split(r'(?<=[.!?])\s+', text)
+    return "\n".join(sents[:sentences_count])
 
-# Ensure needed NLTK data (Streamlit will run this on server at first run)
-nltk_packages = ["punkt", "averaged_perceptron_tagger", "wordnet", "omw-1.4"]
-for pkg in nltk_packages:
+def summarize_text(text, sentences_count=5):
+    """Robust summarizer with automatic retry and fallback."""
     try:
-        nltk.data.find(f"tokenizers/{pkg}") if pkg == "punkt" else nltk.data.find(f"taggers/{pkg}") if pkg == "averaged_perceptron_tagger" else nltk.data.find(f"corpora/{pkg}")
-    except Exception:
+        parser = PlaintextParser.from_string(text, Tokenizer("english"))
+        summarizer = LexRankSummarizer()
+        summary = summarizer(parser.document, sentences_count)
+        return "\n".join(str(s) for s in summary)
+    except:
+        # Retry after punkt download
         try:
-            nltk.download(pkg)
-        except Exception:
-            pass  # if download fails on server, app may still run partially
+            nltk.download("punkt")
+            parser = PlaintextParser.from_string(text, Tokenizer("english"))
+            summarizer = LexRankSummarizer()
+            summary = summarizer(parser.document, sentences_count)
+            return "\n".join(str(s) for s in summary)
+        except:
+            return simple_summary(text, sentences_count)
 
-st.set_page_config(page_title="AI Notes Generator (Free)", page_icon=":memo:", layout="wide")
-st.title("AI Notes Generator — Free (no paid APIs)")
-
-st.sidebar.header("Options")
-summary_sentences = st.sidebar.slider("Summary sentences", 3, 12, 6)
-num_mcq = st.sidebar.slider("Number of MCQs", 1, 12, 8)
-num_imp_q = st.sidebar.slider("Important Questions", 1, 12, 8)
-num_short_ans = st.sidebar.slider("Short Answers", 1, 12, 8)
-enable_pdf = st.sidebar.checkbox("Enable PDF download", value=True)
-
-uploaded = st.file_uploader("Upload PDF or TXT", type=["pdf", "txt"])
-
+# -------------------------------------------------------------------
+# TEXT EXTRACTION
+# -------------------------------------------------------------------
 def extract_text_from_pdf(file_stream):
     text_parts = []
     with pdfplumber.open(file_stream) as pdf:
         for page in pdf.pages:
-            page_text = page.extract_text() or ""
-            text_parts.append(page_text)
+            text_parts.append(page.extract_text() or "")
     return "\n".join(text_parts)
 
 def extract_text(file):
@@ -50,214 +72,223 @@ def extract_text(file):
         return extract_text_from_pdf(file)
     else:
         raw = file.read()
-        if isinstance(raw, bytes):
-            try:
-                return raw.decode("utf-8", errors="ignore")
-            except Exception:
-                return raw.decode("latin-1", errors="ignore")
-        return str(raw)
+        try:
+            return raw.decode("utf-8", errors="ignore")
+        except:
+            return raw.decode("latin-1", errors="ignore")
 
-def summarize_text(text, sentences_count=5):
-    parser = PlaintextParser.from_string(text, Tokenizer("english"))
-    summarizer = LexRankSummarizer()
-    summary = summarizer(document=parser.document, sentences_count=sentences_count)
-    return "\n".join([str(s) for s in summary])
-
+# -------------------------------------------------------------------
+# QUESTION GENERATORS
+# -------------------------------------------------------------------
 def extract_nouns(text, topk=50):
     tokens = word_tokenize(text)
     tagged = pos_tag(tokens)
-    nouns = [w for w,pos in tagged if pos.startswith('NN') and len(w)>2]
+    nouns = [w for w,p in tagged if p.startswith("NN") and len(w)>2]
     freq = {}
     for n in nouns:
-        freq[n.lower()] = freq.get(n.lower(),0) + 1
+        freq[n.lower()] = freq.get(n.lower(),0)+1
     sorted_n = sorted(freq.items(), key=lambda x: x[1], reverse=True)
     return [w for w,_ in sorted_n][:topk]
 
-def make_mcqs_from_text(text, n_mcq=8):
+def make_mcqs(text, count=8):
     sentences = re.split(r'(?<=[.!?])\s+', text)
     candidates = [s for s in sentences if len(s.split())>6]
     random.shuffle(candidates)
-    freq_nouns = extract_nouns(text, topk=200)
+
+    nouns = extract_nouns(text, topk=200)
     mcqs = []
+
     for s in candidates:
-        # pick a noun in sentence
         words = word_tokenize(s)
         tagged = pos_tag(words)
-        nouns_in_s = [w for w,p in tagged if p.startswith('NN') and len(w)>2]
+        nouns_in_s = [w for w,p in tagged if p.startswith("NN")]
+
         if not nouns_in_s:
             continue
+
         answer = random.choice(nouns_in_s)
-        # build distractors: try wordnet synonyms/hypernyms, then frequent nouns
+
         distractors = []
-        syns = []
+
+        # Try WordNet synonyms
         for syn in wn.synsets(answer):
-            for lem in syn.lemmas():
-                w = lem.name().replace('_',' ')
-                if w.lower()!=answer.lower() and w not in distractors:
-                    syns.append(w)
-        for w in syns[:2]:
-            distractors.append(w)
-        for w in freq_nouns:
-            if w.lower()!=answer.lower() and w not in distractors:
-                distractors.append(w)
-            if len(distractors)>=3:
-                break
-        if len(distractors)<3:
-            # fallback: random words from sentence
-            words_alpha = [t for t in words if t.isalpha() and t.lower()!=answer.lower()]
-            random.shuffle(words_alpha)
-            for w in words_alpha:
-                if w not in distractors:
+            for lemma in syn.lemmas():
+                w = lemma.name().replace("_", " ")
+                if w.lower() != answer.lower():
                     distractors.append(w)
+        distractors = list(dict.fromkeys(distractors))[:2]  # remove duplicates
+
+        # Add frequent nouns
+        for n in nouns:
+            if len(distractors) >= 3:
+                break
+            if n.lower() != answer.lower():
+                distractors.append(n)
+
+        # Fallback random distractors
+        if len(distractors) < 3:
+            w2 = [w for w in words if w.isalpha() and w.lower()!=answer.lower()]
+            random.shuffle(w2)
+            for w in w2:
+                distractors.append(w)
                 if len(distractors)>=3:
                     break
-        if len(distractors)<3:
+
+        if len(distractors) < 3:
             continue
+
+        # Mask answer
         q_text = s.replace(answer, "_____")
+
         options = [answer] + distractors[:3]
         random.shuffle(options)
         correct = chr(65 + options.index(answer))
+
         mcqs.append({
-            "question": q_text.strip(),
+            "question": q_text,
             "options": options,
             "answer": correct,
             "answer_text": answer
         })
-        if len(mcqs)>=n_mcq:
+
+        if len(mcqs) >= count:
             break
+
     return mcqs
 
-def make_important_questions(text, n=8):
+def make_important_questions(text, count=8):
     sentences = re.split(r'(?<=[.!?])\s+', text)
-    long_sorted = sorted([s.strip() for s in sentences if len(s.strip())>30], key=lambda s: len(s), reverse=True)
+    long_sentences = sorted(
+        [s for s in sentences if len(s.strip())>30],
+        key=lambda s: len(s),
+        reverse=True
+    )
     qs = []
-    for s in long_sorted[:n*2]:
-        qs.append("Explain: " + (s[:320] + "..." if len(s)>320 else s))
-        if len(qs)>=n:
+    for s in long_sentences:
+        qs.append("Explain: " + s[:300])
+        if len(qs) >= count:
             break
     return qs
 
-def make_short_answers(text, n=8):
+def make_short_answers(text, count=8):
     sentences = re.split(r'(?<=[.!?])\s+', text)
-    keywords = ['is', 'are', 'means', 'refers to', 'defined as', 'consists of', 'used to', 'calculate']
+    keywords = ['is', 'are', 'means', 'refers to', 'defined as']
+
     chosen = []
     for s in sentences:
-        low = s.lower()
-        if any(k in low for k in keywords) and len(s.split())<40:
+        if len(chosen) >= count:
+            break
+        if any(k in s.lower() for k in keywords):
             chosen.append(s.strip())
-        if len(chosen)>=n:
-            break
-    if len(chosen)<n:
+
+    if len(chosen) < count:
         for s in sentences:
-            if s.strip() and s.strip() not in chosen:
+            if s.strip():
                 chosen.append(s.strip())
-            if len(chosen)>=n:
-                break
-    pairs = []
-    for s in chosen[:n]:
-        q = f"What is: {s.split('.')[0][:120]}?"
-        a = s.strip()
-        pairs.append({"q":q,"a":a})
-    return pairs
+                if len(chosen) >= count:
+                    break
 
-def most_likely_questions(text, n=8):
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    headings = [l for l in lines if (l.isupper() and len(l.split())<10)]
+    qa = []
+    for s in chosen[:count]:
+        q = "What is: " + s[:60] + "?"
+        qa.append({"q": q, "a": s})
+    return qa
+
+def make_probable_questions(text, count=8):
+    nouns = extract_nouns(text, topk=20)
     qs = []
-    for h in headings[:n]:
-        qs.append(f"Discuss: {h}")
-    if len(qs)>=n:
-        return qs[:n]
-    freq_nouns = extract_nouns(text, topk=50)
-    for noun in freq_nouns[:n]:
-        qs.append(f"Why is '{noun}' important in this topic?")
-        if len(qs)>=n:
-            break
-    if len(qs)<n:
-        long_sents = sorted(re.split(r'(?<=[.!?])\s+', text), key=lambda s: len(s), reverse=True)
-        for s in long_sents[:n]:
-            qs.append("Discuss: " + (s[:150] + "..." if len(s)>150 else s))
-            if len(qs)>=n:
-                break
-    return qs[:n]
+    for n in nouns[:count]:
+        qs.append(f"Why is '{n}' important in this topic?")
+    return qs
 
-# UI
+# -------------------------------------------------------------------
+# STREAMLIT UI
+# -------------------------------------------------------------------
+st.set_page_config(page_title="AI Notes Generator Free", page_icon="📘")
+st.title("📘 AI Notes Generator — FREE Version")
+
+st.sidebar.header("Options")
+summary_len = st.sidebar.slider("Summary sentences:", 3, 12, 6)
+mcq_count = st.sidebar.slider("Number of MCQs:", 1, 12, 6)
+impq_count = st.sidebar.slider("Important Questions:", 1, 12, 6)
+sa_count = st.sidebar.slider("Short Answers:", 1, 12, 6)
+enable_pdf = st.sidebar.checkbox("Enable PDF download", True)
+
+uploaded = st.file_uploader("Upload PDF or TXT", type=["pdf", "txt"])
+
 if uploaded:
-    st.info(f"Uploaded: {uploaded.name}")
     raw_text = extract_text(uploaded)
+
     if not raw_text.strip():
-        st.error("No text extracted. If PDF is scanned, OCR is required (not included).")
+        st.error("No extractable text found. Scanned PDFs are not supported (need OCR).")
         st.stop()
 
-    with st.expander("Preview (first 2000 chars)"):
-        st.write(raw_text[:2000] + ("..." if len(raw_text)>2000 else ""))
+    with st.expander("Preview text"):
+        st.write(raw_text[:2000] + "...")
 
-    if st.button("Generate (free)"):
-        with st.spinner("Generating summary & questions..."):
-            summary = summarize_text(raw_text, sentences_count=summary_sentences)
-            mcqs = make_mcqs_from_text(raw_text, n_mcq=num_mcq)
-            imp_qs = make_important_questions(raw_text, n=num_imp_q)
-            short_ans = make_short_answers(raw_text, n=num_short_ans)
-            likely_qs = most_likely_questions(raw_text, n=8)
+    if st.button("Generate (FREE)"):
+        with st.spinner("Processing..."):
+            summary = summarize_text(raw_text, summary_len)
+            mcqs = make_mcqs(raw_text, mcq_count)
+            impqs = make_important_questions(raw_text, impq_count)
+            shortans = make_short_answers(raw_text, sa_count)
+            probable = make_probable_questions(raw_text, 6)
 
         st.header("Summary")
         st.write(summary)
 
         st.header("MCQs")
-        if mcqs:
-            for i,m in enumerate(mcqs,1):
-                st.markdown(f"**Q{i}.** {m['question']}")
-                for oi,opt in enumerate(m['options']):
-                    st.write(f"- {chr(65+oi)}. {opt}")
-                st.write(f"**Answer:** {m['answer']} — {m['answer_text']}")
-        else:
-            st.write("No MCQs generated.")
+        for i,m in enumerate(mcqs,1):
+            st.write(f"**Q{i}.** {m['question']}")
+            for oi,opt in enumerate(m['options']):
+                st.write(f"- {chr(65+oi)}. {opt}")
+            st.write(f"**Answer:** {m['answer']} ({m['answer_text']})")
 
         st.header("Important Questions")
-        for i,q in enumerate(imp_qs,1):
+        for i,q in enumerate(impqs,1):
             st.write(f"{i}. {q}")
 
-        st.header("Short Answer Q&A")
-        for i,p in enumerate(short_ans,1):
+        st.header("Short Answer Questions")
+        for i,p in enumerate(shortans,1):
             st.write(f"{i}. Q: {p['q']}")
             st.write(f"   A: {p['a']}")
 
-        st.header("Highly Likely Questions")
-        for i,q in enumerate(likely_qs,1):
+        st.header("Most Probable Questions")
+        for i,q in enumerate(probable,1):
             st.write(f"{i}. {q}")
 
-        # Prepare downloads
-        full_txt = f"=== Summary ===\n{summary}\n\n=== MCQs ===\n"
-        for i,m in enumerate(mcqs,1):
-            full_txt += f"Q{i}. {m['question']}\n"
-            for oi,opt in enumerate(m['options']):
-                full_txt += f"  {chr(65+oi)}. {opt}\n"
-            full_txt += f"Answer: {m['answer']} — {m['answer_text']}\n\n"
-        full_txt += "\n=== Important Questions ===\n" + "\n".join(imp_qs) + "\n\n"
-        full_txt += "=== Short Answers ===\n" + "\n".join([f"Q{i+1}. {p['q']}\nA: {p['a']}" for i,p in enumerate(short_ans)]) + "\n\n"
-        full_txt += "=== Highly Likely Questions ===\n" + "\n".join(likely_qs)
+        # ---------------------------
+        # DOWNLOAD AS TEXT
+        # ---------------------------
+        txt = f"SUMMARY:\n{summary}\n\nMCQs:\n"
+        for m in mcqs:
+            txt += m['question'] + "\n"
+            for opt in m['options']:
+                txt += f"- {opt}\n"
+            txt += f"Answer: {m['answer_text']}\n\n"
 
-        st.download_button("Download .txt", full_txt, file_name=f"{uploaded.name}_notes.txt", mime="text/plain")
+        st.download_button("Download Notes (.txt)", txt, file_name="notes.txt")
 
+        # ---------------------------
+        # DOWNLOAD AS PDF
+        # ---------------------------
         if enable_pdf:
             buf = io.BytesIO()
             pdf = FPDF()
-            pdf.set_auto_page_break(auto=True, margin=12)
             pdf.add_page()
+            pdf.set_auto_page_break(auto=True, margin=10)
             pdf.set_font("Arial", size=12)
-            pdf.multi_cell(0,6,txt=f"AI Notes (Free) for {uploaded.name}\n\n")
-            pdf.multi_cell(0,6,txt="Summary:\n"+summary+"\n\n")
-            pdf.multi_cell(0,6,txt="MCQs:\n")
-            for i,m in enumerate(mcqs,1):
-                pdf.multi_cell(0,6,txt=f"{i}. {m['question']}")
-                for oi,opt in enumerate(m['options']):
-                    pdf.multi_cell(0,6,txt=f"    {chr(65+oi)}. {opt}")
-                pdf.multi_cell(0,6,txt=f"    Answer: {m['answer']} — {m['answer_text']}\n")
-            pdf.multi_cell(0,6,txt="\nImportant Questions:\n" + "\n".join(imp_qs) + "\n\n")
-            pdf.multi_cell(0,6,txt="Short Answer Q&A:\n" + "\n".join([f"Q{i+1}. {p['q']}\nA: {p['a']}" for i,p in enumerate(short_ans)]) + "\n\n")
-            pdf.multi_cell(0,6,txt="Highly Likely Questions:\n" + "\n".join(likely_qs))
+
+            pdf.multi_cell(0, 6, f"AI Notes Generated (FREE)\n\nSUMMARY:\n{summary}\n\nMCQs:\n")
+            for m in mcqs:
+                pdf.multi_cell(0, 6, f"{m['question']}")
+                for opt in m['options']:
+                    pdf.multi_cell(0, 6, f"- {opt}")
+                pdf.multi_cell(0, 6, f"Answer: {m['answer_text']}\n")
+
             pdf.output(buf)
             buf.seek(0)
-            st.download_button("Download .pdf", buf, file_name=f"{uploaded.name}_notes.pdf", mime="application/pdf")
+            st.download_button("Download Notes (.pdf)", buf, file_name="notes.pdf", mime="application/pdf")
 else:
-    st.info("Upload a PDF or TXT file to start (free version).")
+    st.info("Upload a PDF or TXT file to begin.")
+
