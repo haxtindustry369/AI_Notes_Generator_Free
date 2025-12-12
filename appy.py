@@ -1,42 +1,16 @@
-# app.py - Minimal, robust free notes generator with unicode-safe PDF fallback
+# app.py - Final robust free notes generator with unicode-safe PDF
 import io
 import os
 import re
 import random
 import collections
+import unicodedata
 from fpdf import FPDF
 import pdfplumber
 import streamlit as st
-import unicodedata
 
 # -------------------------
-# Helper: safe-for-pdf function (always available)
-# -------------------------
-def _make_safe_for_pdf(s: str, allow_unicode: bool) -> str:
-    """
-    If allow_unicode is True, return string unchanged.
-    Otherwise normalize and strip non-ascii characters so FPDF (ASCII) won't crash.
-    """
-    if allow_unicode:
-        return s
-    normalized = unicodedata.normalize("NFKD", s)
-    ascii_bytes = normalized.encode("ascii", "ignore")
-    return ascii_bytes.decode("ascii", "ignore")
-# helper: insert spaces into very long words so FPDF can wrap them
-def _break_long_unbroken_sequences(text: str, max_len: int = 60) -> str:
-    """
-    Insert a space every `max_len` characters inside any long sequence of
-    non-space characters to avoid FPDF "no horizontal space" errors.
-    """
-    # This will replace sequences of non-space characters longer than max_len
-    # with chunks separated by a space (so FPDF can break).
-    def _chunk(match):
-        s = match.group(0)
-        return " ".join(s[i:i+max_len] for i in range(0, len(s), max_len))
-    return re.sub(r'\S{' + str(max_len) + r',}', _chunk, text)
-
-# -------------------------
-# Simple stopwords + tokenizers (no external NLP libs)
+# Helpers: tokenization / stopwords
 # -------------------------
 _STOPWORDS = {
     "the","and","for","that","with","this","from","are","was","were","will","can",
@@ -52,8 +26,23 @@ def _sentence_split(text):
     sents = re.split(r'(?<=[.!?])\s+', text.strip())
     return [s.strip() for s in sents if s.strip()]
 
+# break very long unbroken sequences so FPDF can wrap
+def _break_long_unbroken_sequences(text: str, max_len: int = 30) -> str:
+    def _chunk(match):
+        s = match.group(0)
+        return " ".join(s[i:i+max_len] for i in range(0, len(s), max_len))
+    return re.sub(r'\S{' + str(max_len) + r',}', _chunk, text)
+
+# safe-for-pdf: if unicode font not available, strip non-ascii
+def _make_safe_for_pdf(s: str, allow_unicode: bool) -> str:
+    if allow_unicode:
+        return s
+    normalized = unicodedata.normalize("NFKD", s)
+    ascii_bytes = normalized.encode("ascii", "ignore")
+    return ascii_bytes.decode("ascii", "ignore")
+
 # -------------------------
-# Extraction and summarization (lightweight)
+# Extraction / summarization
 # -------------------------
 def extract_text_from_pdf(file_stream):
     text_parts = []
@@ -105,7 +94,7 @@ def extract_frequent_words(text, topk=50):
     return [w for w,_ in freq.most_common(topk)]
 
 # -------------------------
-# MCQ / question generators
+# MCQ / questions generation
 # -------------------------
 def generate_mcqs(text, count=6):
     sentences = _sentence_split(text)
@@ -275,7 +264,7 @@ if uploaded:
             pdf.set_auto_page_break(auto=True, margin=12)
             pdf.add_page()
 
-            # find font file
+            # try to find font file in repo root
             base_dir = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
             font_filename = "DejaVuSans.ttf"
             font_path = os.path.join(base_dir, font_filename)
@@ -288,6 +277,7 @@ if uploaded:
                     font_loaded = True
                     st.info(f"Using font: {font_path}")
                 else:
+                    # try by plain filename as last resort
                     pdf.add_font("DejaVu", "", font_filename, uni=True)
                     pdf.set_font("DejaVu", size=12)
                     font_loaded = True
@@ -297,22 +287,38 @@ if uploaded:
                 font_loaded = False
 
             try:
-                pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n", font_loaded))
+                safe_summary = _make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n", font_loaded)
+                safe_summary = _break_long_unbroken_sequences(safe_summary, max_len=60)
+                pdf.multi_cell(0, 6, txt=safe_summary)
+
                 pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("MCQs:\n", font_loaded))
                 for i, m in enumerate(mcqs, 1):
-                    pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"{i}. {m['question']}", font_loaded))
+                    qtxt = _make_safe_for_pdf(f"{i}. {m['question']}", font_loaded)
+                    qtxt = _break_long_unbroken_sequences(qtxt, max_len=60)
+                    pdf.multi_cell(0, 6, txt=qtxt)
                     for oi, opt in enumerate(m['options']):
-                        pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"   {chr(65+oi)}. {opt}", font_loaded))
-                    pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"   Answer: {m['answer_text']}\n", font_loaded))
+                        opttxt = _make_safe_for_pdf(f"   {chr(65+oi)}. {opt}", font_loaded)
+                        opttxt = _break_long_unbroken_sequences(opttxt, max_len=60)
+                        pdf.multi_cell(0, 6, txt=opttxt)
+                    ans_line = _make_safe_for_pdf(f"   Answer: {m['answer_text']}\n", font_loaded)
+                    pdf.multi_cell(0, 6, txt=ans_line)
 
-                pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("\nImportant Questions:\n" + "\n".join(imp_qs) + "\n\n", font_loaded))
+                imp_block = _make_safe_for_pdf("\nImportant Questions:\n" + "\n".join(imp_qs) + "\n\n", font_loaded)
+                imp_block = _break_long_unbroken_sequences(imp_block, max_len=60)
+                pdf.multi_cell(0, 6, txt=imp_block)
 
                 pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("Short Answers:\n", font_loaded))
                 for i, p in enumerate(short_ans, 1):
-                    pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"Q{i}. {p['q']}", font_loaded))
-                    pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"A: {p['a']}\n", font_loaded))
+                    qline = _make_safe_for_pdf(f"Q{i}. {p['q']}", font_loaded)
+                    qline = _break_long_unbroken_sequences(qline, max_len=60)
+                    pdf.multi_cell(0, 6, txt=qline)
+                    aline = _make_safe_for_pdf(f"A: {p['a']}\n", font_loaded)
+                    aline = _break_long_unbroken_sequences(aline, max_len=60)
+                    pdf.multi_cell(0, 6, txt=aline)
 
-                pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("Most Probable Questions:\n" + "\n".join(probable), font_loaded))
+                prob_block = _make_safe_for_pdf("Most Probable Questions:\n" + "\n".join(probable), font_loaded)
+                prob_block = _break_long_unbroken_sequences(prob_block, max_len=60)
+                pdf.multi_cell(0, 6, txt=prob_block)
 
                 pdf.output(buf)
                 buf.seek(0)
@@ -322,97 +328,58 @@ if uploaded:
                     file_name=f"{uploaded.name}_notes.pdf",
                     mime="application/pdf"
                 )
+
             except Exception:
-                # fallback ASCII-only pdf (robust, very defensive)
+                # fallback ASCII-only pdf (very defensive)
                 st.error("PDF generation failed with Unicode font, creating simple ASCII PDF as fallback.")
                 fallback_buf = io.BytesIO()
                 fallback_pdf = FPDF()
                 fallback_pdf.add_page()
-
-                # use a smaller font for fallback to reduce width problems
                 fallback_pdf.set_font("Arial", size=9)
 
-                # prepare safe text: normalize and remove non-ascii
                 safe_text = _make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n", False)
+                safe_text = _break_long_unbroken_sequences(safe_text, max_len=30)
 
-                # more aggressive breaking of very long sequences (every 30 chars)
-                def _break_long_tokens(text: str, max_len: int = 30) -> str:
-                    def _chunk(m):
-                        s = m.group(0)
-                        return " ".join(s[i:i+max_len] for i in range(0, len(s), max_len))
-                    return re.sub(r'\S{' + str(max_len) + r',}', _chunk, text)
-
-                safe_text = _break_long_tokens(safe_text, max_len=30)
-
-                # helper to defensively write a single logical "line" to pdf
-                def _write_line_defensively(pdf_obj, line: str, height=6, max_chunk=80):
-                """
-                Try to write `line` with multi_cell. If multi_cell raises because it can't
-                render a single character, split the line into smaller chunks and write them.
-                """
-                try:
-                    pdf_obj.multi_cell(0, height, txt=line)
-                    return
-                except Exception:
-                    # fallback: split into small chunks (max_chunk chars) and write each
-                    # ensure even smaller pieces if still failing
-                    start = 0
-                    L = len(line)
-                    while start < L:
-                        end = min(start + max_chunk, L)
-                        piece = line[start:end]
-                        try:
-                            pdf_obj.multi_cell(0, height, txt=piece)
-                        except Exception:
-                            # try even smaller pieces (very defensive)
-                            sub_start = 0
-                            while sub_start < len(piece):
-                                sub_end = min(sub_start + 30, len(piece))
-                                sub_piece = piece[sub_start:sub_end]
-                                try:
-                                    pdf_obj.multi_cell(0, height, txt=sub_piece)
-                                except Exception:
-                                    # last resort: write single characters so it cannot fail
-                                    for ch in sub_piece:
-                                        try:
-                                            pdf_obj.multi_cell(0, height, txt=ch)
-                                        except Exception:
-                                            # give up on this char (should be ASCII only already)
-                                            continue
-                                sub_start = sub_end
-                        start = end
-
-            # write safe_text line-by-line, using the defensive writer
-            for line in safe_text.splitlines():
-                if not line.strip():
-                    fallback_pdf.ln(4)
-                    continue
-                # also ensure we don't pass a super-long line to multi_cell
-                # split on existing spaces into chunks of <= 200 chars then write each with defensive writer
-                parts = []
-                cur = ""
-                for token in line.split(" "):
-                    if len(cur) + 1 + len(token) <= 200:
-                        cur = (cur + " " + token).strip()
-                    else:
+                # write defensively: split into parts and use multi_cell per part
+                for line in safe_text.splitlines():
+                    if not line.strip():
+                        fallback_pdf.ln(4)
+                        continue
+                    parts = []
+                    cur = ""
+                    for token in line.split(" "):
+                        if len(cur) + 1 + len(token) <= 200:
+                            cur = (cur + " " + token).strip()
+                        else:
+                            parts.append(cur)
+                            cur = token
+                    if cur:
                         parts.append(cur)
-                        cur = token
-                if cur:
-                    parts.append(cur)
-                for p in parts:
-                    _write_line_defensively(fallback_pdf, p, height=6, max_chunk=80)
+                    for p in parts:
+                        # write in safe chunks
+                        start = 0
+                        L = len(p)
+                        while start < L:
+                            end = min(start + 80, L)
+                            piece = p[start:end]
+                            try:
+                                fallback_pdf.multi_cell(0, 6, txt=piece)
+                            except Exception:
+                                # last resort: write char by char
+                                for ch in piece:
+                                    try:
+                                        fallback_pdf.multi_cell(0, 6, txt=ch)
+                                    except Exception:
+                                        continue
+                            start = end
 
-            # output fallback pdf
-            fallback_pdf.output(fallback_buf)
-            fallback_buf.seek(0)
-            st.download_button(
-                "Download fallback .pdf",
-                fallback_buf,
-                file_name=f"{uploaded.name}_notes_ascii.pdf",
-                mime="application/pdf"
-            )
-
-
+                fallback_pdf.output(fallback_buf)
+                fallback_buf.seek(0)
+                st.download_button(
+                    "Download fallback .pdf",
+                    fallback_buf,
+                    file_name=f"{uploaded.name}_notes_ascii.pdf",
+                    mime="application/pdf"
+                )
 else:
     st.info("Upload a PDF or TXT file to start (free).")
-
