@@ -325,8 +325,8 @@ if uploaded:
                         opttxt = _make_safe_for_pdf(f"   {chr(65+oi)}. {opt}", font_loaded)
                         opttxt = _break_long_unbroken_sequences(opttxt, max_len=60)
                         pdf.multi_cell(0, 6, txt=opttxt)
-                    ans_line = _make_safe_for_pdf(f"   Answer: {m['answer_text']}\n", font_loaded)
-                    pdf.multi_cell(0, 6, txt=ans_line)
+                   ans_line = _make_safe_for_pdf(f"   Answer: {m['answer_text']}\n", font_loaded)
+                   pdf.multi_cell(0, 6, txt=ans_line)
 
                 imp_block = _make_safe_for_pdf("\nImportant Questions:\n" + "\n".join(imp_qs) + "\n\n", font_loaded)
                 imp_block = _break_long_unbroken_sequences(imp_block, max_len=60)
