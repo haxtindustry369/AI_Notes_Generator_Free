@@ -1,14 +1,30 @@
-# app.py - Minimal, self-contained free notes generator (NO NLTK / NO SUMY / NO spaCy)
+# app.py - Minimal, robust free notes generator with unicode-safe PDF fallback
 import io
+import os
 import re
 import random
 import collections
 from fpdf import FPDF
 import pdfplumber
 import streamlit as st
+import unicodedata
 
 # -------------------------
-# Small stopword set
+# Helper: safe-for-pdf function (always available)
+# -------------------------
+def _make_safe_for_pdf(s: str, allow_unicode: bool) -> str:
+    """
+    If allow_unicode is True, return string unchanged.
+    Otherwise normalize and strip non-ascii characters so FPDF (ASCII) won't crash.
+    """
+    if allow_unicode:
+        return s
+    normalized = unicodedata.normalize("NFKD", s)
+    ascii_bytes = normalized.encode("ascii", "ignore")
+    return ascii_bytes.decode("ascii", "ignore")
+
+# -------------------------
+# Simple stopwords + tokenizers (no external NLP libs)
 # -------------------------
 _STOPWORDS = {
     "the","and","for","that","with","this","from","are","was","were","will","can",
@@ -17,8 +33,15 @@ _STOPWORDS = {
     "their","it","you","your","i","he","she","them","these","those","also","our","may"
 }
 
+def _simple_tokenize_words(text):
+    return re.findall(r"\b[a-zA-Z]{3,}\b", text.lower())
+
+def _sentence_split(text):
+    sents = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [s.strip() for s in sents if s.strip()]
+
 # -------------------------
-# Text extraction
+# Extraction and summarization (lightweight)
 # -------------------------
 def extract_text_from_pdf(file_stream):
     text_parts = []
@@ -27,7 +50,6 @@ def extract_text_from_pdf(file_stream):
             for page in pdf.pages:
                 text_parts.append(page.extract_text() or "")
     except Exception:
-        # fallback: try reading raw bytes -> text (rare)
         try:
             raw = file_stream.read()
             text_parts.append(raw.decode("utf-8", errors="ignore"))
@@ -47,52 +69,31 @@ def extract_text(uploaded_file):
                 return raw.decode("latin-1", errors="ignore")
         return str(raw)
 
-# -------------------------
-# Simple summarizer (frequency scoring)
-# -------------------------
-def _simple_tokenize_words(text):
-    return re.findall(r"\b[a-zA-Z]{3,}\b", text.lower())
-
-def _sentence_split(text):
-    # split into sentences conservatively
-    sents = re.split(r'(?<=[.!?])\s+', text.strip())
-    return [s.strip() for s in sents if s.strip()]
-
 def simple_summary(text, sentence_count=5):
     sents = _sentence_split(text)
     if not sents:
         return ""
-
     words = _simple_tokenize_words(text)
     freq = collections.Counter(w for w in words if w not in _STOPWORDS)
     if not freq:
-        # fallback: return first N sentences
         return "\n".join(sents[:sentence_count])
-
-    # score sentences by sum of word frequencies
     sent_scores = []
     for s in sents:
         tokens = _simple_tokenize_words(s)
         score = sum(freq.get(t,0) for t in tokens)
         sent_scores.append((s, score, len(tokens)))
-
-    # prefer sentences with higher score and reasonable length
     sent_scores.sort(key=lambda x: (x[1], x[2]), reverse=True)
     chosen = [s for s,_,_ in sent_scores[:sentence_count]]
-    # keep original order
     chosen_ordered = [s for s in sents if s in chosen]
     return "\n".join(chosen_ordered)
 
-# -------------------------
-# Lightweight noun/frequent-word extractor (no NLP libs)
-# -------------------------
 def extract_frequent_words(text, topk=50):
     tokens = _simple_tokenize_words(text)
     freq = collections.Counter(t for t in tokens if t not in _STOPWORDS)
     return [w for w,_ in freq.most_common(topk)]
 
 # -------------------------
-# MCQ generator (regex-based)
+# MCQ / question generators
 # -------------------------
 def generate_mcqs(text, count=6):
     sentences = _sentence_split(text)
@@ -100,27 +101,20 @@ def generate_mcqs(text, count=6):
     random.shuffle(candidates)
     freq_words = extract_frequent_words(text, topk=200)
     mcqs = []
-
     for s in candidates:
         s_lower = s.lower()
-        # find frequent words occurring in sentence
         possible_answers = [w for w in freq_words if re.search(r"\b" + re.escape(w) + r"\b", s_lower)]
         if possible_answers:
             answer = random.choice(possible_answers)
         else:
-            # pick a longer content word from the sentence
             words = re.findall(r"\b[a-zA-Z]{4,}\b", s)
             words = [w for w in words if w.lower() not in _STOPWORDS]
             if not words:
                 continue
             answer = random.choice(words).lower()
-
-        # build distractors from other frequent words
         distractors = [w for w in freq_words if w != answer]
         random.shuffle(distractors)
         distractors = distractors[:3]
-
-        # if not enough, take other words from sentence
         if len(distractors) < 3:
             extras = [w.lower() for w in re.findall(r"\b[a-zA-Z]{4,}\b", s) if w.lower() != answer and w.lower() not in _STOPWORDS]
             random.shuffle(extras)
@@ -129,47 +123,34 @@ def generate_mcqs(text, count=6):
                     distractors.append(e)
                 if len(distractors) >= 3:
                     break
-
         if len(distractors) < 3:
             continue
-
-        # Mask first occurrence (case-insensitive)
         pattern = re.compile(re.escape(answer), re.IGNORECASE)
         q_text = pattern.sub("_____", s, count=1)
-
-        # prepare options (capitalize for readability)
         options = [answer] + distractors[:3]
         options_display = [opt.capitalize() for opt in options]
         random.shuffle(options_display)
         correct_index = next(i for i,opt in enumerate(options_display) if opt.lower() == answer.lower())
         correct_letter = chr(65 + correct_index)
-
         mcqs.append({
             "question": q_text,
             "options": options_display,
             "answer": correct_letter,
             "answer_text": answer
         })
-
         if len(mcqs) >= count:
             break
-
     return mcqs
 
-# -------------------------
-# Important questions & short answers (heuristic)
-# -------------------------
 def generate_important_questions(text, count=8):
     sentences = _sentence_split(text)
-    # choose longer sentences as prompts for long-answer questions
     long_sorted = sorted([s for s in sentences if len(s) > 80], key=lambda x: len(x), reverse=True)
     qs = []
-    for s in long_sorted[:count*2]:
+    for s in long_sorted:
         qs.append("Explain: " + (s[:300] + ("..." if len(s) > 300 else "")))
         if len(qs) >= count:
             break
     if not qs:
-        # fallback: create questions from frequent words
         freq = extract_frequent_words(text, topk=count)
         for w in freq:
             qs.append(f"Discuss the importance of '{w}' in this topic.")
@@ -258,14 +239,15 @@ if uploaded:
         for i,q in enumerate(probable,1):
             st.write(f"{i}. {q}")
 
-        # Download text
+        # -------------------------
+        # Download as TXT
+        # -------------------------
         result_txt = f"=== SUMMARY ===\n{summary}\n\n=== MCQS ===\n"
         for i,m in enumerate(mcqs,1):
             result_txt += f"Q{i}. {m['question']}\n"
             for oi,opt in enumerate(m['options']):
                 result_txt += f"  {chr(65+oi)}. {opt}\n"
             result_txt += f"Answer: {m['answer_text']}\n\n"
-
         result_txt += "\n=== IMPORTANT QUESTIONS ===\n" + "\n".join(imp_qs) + "\n\n"
         result_txt += "=== SHORT ANSWERS ===\n" + "\n".join([f"Q{i+1}. {p['q']}\nA: {p['a']}" for i,p in enumerate(short_ans)]) + "\n\n"
         result_txt += "=== MOST PROBABLE ===\n" + "\n".join(probable)
@@ -273,93 +255,79 @@ if uploaded:
         st.download_button("Download .txt", result_txt, file_name=f"{uploaded.name}_notes.txt", mime="text/plain")
 
         # -------------------------
-# PDF generation (unicode-safe with fallback)
-# -------------------------
-if enable_pdf:
-    buf = io.BytesIO()
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=12)
-    pdf.add_page()
+        # PDF generation (unicode-safe with fallback)
+        # -------------------------
+        if enable_pdf:
+            buf = io.BytesIO()
+            pdf = FPDF()
+            pdf.set_auto_page_break(auto=True, margin=12)
+            pdf.add_page()
 
-    # Try to find font file relative to this file's directory
-    import os, unicodedata
-    base_dir = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
-    font_filename = "DejaVuSans.ttf"
-    font_path = os.path.join(base_dir, font_filename)
+            # find font file
+            base_dir = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
+            font_filename = "DejaVuSans.ttf"
+            font_path = os.path.join(base_dir, font_filename)
 
-    font_loaded = False
-    try:
-        if os.path.exists(font_path):
-            # register the font using full path; uni=True enables Unicode
-            pdf.add_font("DejaVu", "", font_path, uni=True)
-            pdf.set_font("DejaVu", size=12)
-            font_loaded = True
-            st.info(f"Using font: {font_path}")
-        else:
-            # try plain name as a fallback (if font is in working dir)
-            pdf.add_font("DejaVu", "", font_filename, uni=True)
-            pdf.set_font("DejaVu", size=12)
-            font_loaded = True
-            st.info(f"Using font by name: {font_filename}")
-    except Exception as e:
-        # If font registration fails, note it and we'll fallback to ASCII-safe writing later
-        st.warning("Could not load Unicode font. PDF will fallback to ASCII-only text.")
-        font_loaded = False
+            font_loaded = False
+            try:
+                if os.path.exists(font_path):
+                    pdf.add_font("DejaVu", "", font_path, uni=True)
+                    pdf.set_font("DejaVu", size=12)
+                    font_loaded = True
+                    st.info(f"Using font: {font_path}")
+                else:
+                    pdf.add_font("DejaVu", "", font_filename, uni=True)
+                    pdf.set_font("DejaVu", size=12)
+                    font_loaded = True
+                    st.info(f"Using font by name: {font_filename}")
+            except Exception:
+                st.warning("Could not load Unicode font. PDF will fallback to ASCII-only text.")
+                font_loaded = False
 
-    def _make_safe_for_pdf(s: str) -> str:
-        """
-        If Unicode font is not available, remove/replace non-ASCII characters safely.
-        If Unicode font is available, return the string unchanged.
-        """
-        if font_loaded:
-            return s
-        # normalize then drop non-ascii
-        normalized = unicodedata.normalize("NFKD", s)
-        ascii_bytes = normalized.encode("ascii", "ignore")
-        return ascii_bytes.decode("ascii", "ignore")
+            try:
+                pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n", font_loaded))
+                pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("MCQs:\n", font_loaded))
+                for i, m in enumerate(mcqs, 1):
+                    pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"{i}. {m['question']}", font_loaded))
+                    for oi, opt in enumerate(m['options']):
+                        pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"   {chr(65+oi)}. {opt}", font_loaded))
+                    pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"   Answer: {m['answer_text']}\n", font_loaded))
 
-    # Write content (use helper to avoid crashes)
-    try:
-        pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n"))
-        pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("MCQs:\n"))
-        for i, m in enumerate(mcqs, 1):
-            pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"{i}. {m['question']}"))
-            for oi, opt in enumerate(m['options']):
-                pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"   {chr(65+oi)}. {opt}"))
-            pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"   Answer: {m['answer_text']}\n"))
+                pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("\nImportant Questions:\n" + "\n".join(imp_qs) + "\n\n", font_loaded))
 
-        pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("\nImportant Questions:\n" + "\n".join(imp_qs) + "\n\n"))
+                pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("Short Answers:\n", font_loaded))
+                for i, p in enumerate(short_ans, 1):
+                    pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"Q{i}. {p['q']}", font_loaded))
+                    pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"A: {p['a']}\n", font_loaded))
 
-        pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("Short Answers:\n"))
-        for i, p in enumerate(short_ans, 1):
-            pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"Q{i}. {p['q']}"))
-            pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"A: {p['a']}\n"))
+                pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("Most Probable Questions:\n" + "\n".join(probable), font_loaded))
 
-        pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("Most Probable Questions:\n" + "\n".join(probable)))
+                pdf.output(buf)
+                buf.seek(0)
+                st.download_button(
+                    "Download .pdf",
+                    buf,
+                    file_name=f"{uploaded.name}_notes.pdf",
+                    mime="application/pdf"
+                )
+            except Exception:
+                # fallback ASCII-only pdf
+                st.error("PDF generation failed with Unicode font, creating simple ASCII PDF as fallback.")
+                fallback_buf = io.BytesIO()
+                fallback_pdf = FPDF()
+                fallback_pdf.add_page()
+                fallback_pdf.set_font("Arial", size=12)
+                safe_text = _make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n", False)
+                for line in safe_text.splitlines():
+                    fallback_pdf.multi_cell(0, 6, txt=line)
+                fallback_pdf.output(fallback_buf)
+                fallback_buf.seek(0)
+                st.download_button(
+                    "Download fallback .pdf",
+                    fallback_buf,
+                    file_name=f"{uploaded.name}_notes_ascii.pdf",
+                    mime="application/pdf"
+                )
+else:
+    st.info("Upload a PDF or TXT file to start (free).")
 
-        pdf.output(buf)
-        buf.seek(0)
-        st.download_button(
-            "Download .pdf",
-            buf,
-            file_name=f"{uploaded.name}_notes.pdf",
-            mime="application/pdf"
-        )
-    except Exception as pdf_err:
-        # If anything still goes wrong, create an ASCII-only PDF using fallback text
-        st.error("PDF generation failed with Unicode font, creating simple ASCII PDF as fallback.")
-        fallback_buf = io.BytesIO()
-        fallback_pdf = FPDF()
-        fallback_pdf.add_page()
-        fallback_pdf.set_font("Arial", size=12)
-        safe_text = _make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n")
-        for line in safe_text.splitlines():
-            fallback_pdf.multi_cell(0, 6, txt=line)
-        fallback_pdf.output(fallback_buf)
-        fallback_buf.seek(0)
-        st.download_button(
-            "Download fallback .pdf",
-            fallback_buf,
-            file_name=f"{uploaded.name}_notes_ascii.pdf",
-            mime="application/pdf"
-        )
