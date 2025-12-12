@@ -321,7 +321,7 @@ if uploaded:
                    qtxt = _sanitize_for_unicode_pdf(qtxt)   # <-- NEW
                    pdf.multi_cell(0, 6, txt=qtxt)
 
-                    for oi, opt in enumerate(m['options']):
+                   for oi, opt in enumerate(m['options']):
                         opttxt = _make_safe_for_pdf(f"   {chr(65+oi)}. {opt}", font_loaded)
                         opttxt = _break_long_unbroken_sequences(opttxt, max_len=60)
                         pdf.multi_cell(0, 6, txt=opttxt)
