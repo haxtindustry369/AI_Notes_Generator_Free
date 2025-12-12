@@ -272,25 +272,94 @@ if uploaded:
 
         st.download_button("Download .txt", result_txt, file_name=f"{uploaded.name}_notes.txt", mime="text/plain")
 
-        # PDF
-        if enable_pdf:
-            buf = io.BytesIO()
-            pdf = FPDF()
-            pdf.set_auto_page_break(auto=True, margin=12)
-            pdf.add_page()
-            pdf.set_font("Arial", size=12)
-            pdf.multi_cell(0,6,txt=f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n")
-            pdf.multi_cell(0,6,txt="MCQs:\n")
-            for i,m in enumerate(mcqs,1):
-                pdf.multi_cell(0,6,txt=f"{i}. {m['question']}")
-                for oi,opt in enumerate(m['options']):
-                    pdf.multi_cell(0,6,txt=f"   {chr(65+oi)}. {opt}")
-                pdf.multi_cell(0,6,txt=f"   Answer: {m['answer_text']}\n")
-            pdf.multi_cell(0,6,txt="\nImportant Questions:\n" + "\n".join(imp_qs) + "\n\n")
-            pdf.multi_cell(0,6,txt="Short Answers:\n" + "\n".join([f"Q{i+1}. {p['q']}\nA: {p['a']}" for i,p in enumerate(short_ans)]) + "\n\n")
-            pdf.multi_cell(0,6,txt="Most Probable:\n" + "\n".join(probable))
-            pdf.output(buf)
-            buf.seek(0)
-            st.download_button("Download .pdf", buf, file_name=f"{uploaded.name}_notes.pdf", mime="application/pdf")
-else:
-    st.info("Upload a PDF or TXT file to start (free).")
+        # -------------------------
+# PDF generation (unicode-safe with fallback)
+# -------------------------
+if enable_pdf:
+    buf = io.BytesIO()
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+
+    # Try to find font file relative to this file's directory
+    import os, unicodedata
+    base_dir = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
+    font_filename = "DejaVuSans.ttf"
+    font_path = os.path.join(base_dir, font_filename)
+
+    font_loaded = False
+    try:
+        if os.path.exists(font_path):
+            # register the font using full path; uni=True enables Unicode
+            pdf.add_font("DejaVu", "", font_path, uni=True)
+            pdf.set_font("DejaVu", size=12)
+            font_loaded = True
+            st.info(f"Using font: {font_path}")
+        else:
+            # try plain name as a fallback (if font is in working dir)
+            pdf.add_font("DejaVu", "", font_filename, uni=True)
+            pdf.set_font("DejaVu", size=12)
+            font_loaded = True
+            st.info(f"Using font by name: {font_filename}")
+    except Exception as e:
+        # If font registration fails, note it and we'll fallback to ASCII-safe writing later
+        st.warning("Could not load Unicode font. PDF will fallback to ASCII-only text.")
+        font_loaded = False
+
+    def _make_safe_for_pdf(s: str) -> str:
+        """
+        If Unicode font is not available, remove/replace non-ASCII characters safely.
+        If Unicode font is available, return the string unchanged.
+        """
+        if font_loaded:
+            return s
+        # normalize then drop non-ascii
+        normalized = unicodedata.normalize("NFKD", s)
+        ascii_bytes = normalized.encode("ascii", "ignore")
+        return ascii_bytes.decode("ascii", "ignore")
+
+    # Write content (use helper to avoid crashes)
+    try:
+        pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n"))
+        pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("MCQs:\n"))
+        for i, m in enumerate(mcqs, 1):
+            pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"{i}. {m['question']}"))
+            for oi, opt in enumerate(m['options']):
+                pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"   {chr(65+oi)}. {opt}"))
+            pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"   Answer: {m['answer_text']}\n"))
+
+        pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("\nImportant Questions:\n" + "\n".join(imp_qs) + "\n\n"))
+
+        pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("Short Answers:\n"))
+        for i, p in enumerate(short_ans, 1):
+            pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"Q{i}. {p['q']}"))
+            pdf.multi_cell(0, 6, txt=_make_safe_for_pdf(f"A: {p['a']}\n"))
+
+        pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("Most Probable Questions:\n" + "\n".join(probable)))
+
+        pdf.output(buf)
+        buf.seek(0)
+        st.download_button(
+            "Download .pdf",
+            buf,
+            file_name=f"{uploaded.name}_notes.pdf",
+            mime="application/pdf"
+        )
+    except Exception as pdf_err:
+        # If anything still goes wrong, create an ASCII-only PDF using fallback text
+        st.error("PDF generation failed with Unicode font, creating simple ASCII PDF as fallback.")
+        fallback_buf = io.BytesIO()
+        fallback_pdf = FPDF()
+        fallback_pdf.add_page()
+        fallback_pdf.set_font("Arial", size=12)
+        safe_text = _make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n")
+        for line in safe_text.splitlines():
+            fallback_pdf.multi_cell(0, 6, txt=line)
+        fallback_pdf.output(fallback_buf)
+        fallback_buf.seek(0)
+        st.download_button(
+            "Download fallback .pdf",
+            fallback_buf,
+            file_name=f"{uploaded.name}_notes_ascii.pdf",
+            mime="application/pdf"
+        )
