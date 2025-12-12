@@ -323,95 +323,94 @@ if uploaded:
                     mime="application/pdf"
                 )
             except Exception:
-                # fallback ASCII-only pdf (robust)
                 # fallback ASCII-only pdf (robust, very defensive)
-st.error("PDF generation failed with Unicode font, creating simple ASCII PDF as fallback.")
-fallback_buf = io.BytesIO()
-fallback_pdf = FPDF()
-fallback_pdf.add_page()
+                st.error("PDF generation failed with Unicode font, creating simple ASCII PDF as fallback.")
+                fallback_buf = io.BytesIO()
+                fallback_pdf = FPDF()
+                fallback_pdf.add_page()
 
-# use a smaller font for fallback to reduce width problems
-fallback_pdf.set_font("Arial", size=9)
+                # use a smaller font for fallback to reduce width problems
+                fallback_pdf.set_font("Arial", size=9)
 
-# prepare safe text: normalize and remove non-ascii
-safe_text = _make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n", False)
+                # prepare safe text: normalize and remove non-ascii
+                safe_text = _make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n", False)
 
-# more aggressive breaking of very long sequences (every 30 chars)
-def _break_long_tokens(text: str, max_len: int = 30) -> str:
-    def _chunk(m):
-        s = m.group(0)
-        return " ".join(s[i:i+max_len] for i in range(0, len(s), max_len))
-    return re.sub(r'\S{' + str(max_len) + r',}', _chunk, text)
+                # more aggressive breaking of very long sequences (every 30 chars)
+                def _break_long_tokens(text: str, max_len: int = 30) -> str:
+                    def _chunk(m):
+                        s = m.group(0)
+                        return " ".join(s[i:i+max_len] for i in range(0, len(s), max_len))
+                    return re.sub(r'\S{' + str(max_len) + r',}', _chunk, text)
 
-safe_text = _break_long_tokens(safe_text, max_len=30)
+                safe_text = _break_long_tokens(safe_text, max_len=30)
 
-# helper to defensively write a single logical "line" to pdf
-def _write_line_defensively(pdf_obj, line: str, height=6, max_chunk=80):
-    """
-    Try to write `line` with multi_cell. If multi_cell raises because it can't
-    render a single character, split the line into smaller chunks and write them.
-    """
-    try:
-        pdf_obj.multi_cell(0, height, txt=line)
-        return
-    except Exception:
-        # fallback: split into small chunks (max_chunk chars) and write each
-        # ensure even smaller pieces if still failing
-        start = 0
-        L = len(line)
-        while start < L:
-            end = min(start + max_chunk, L)
-            piece = line[start:end]
-            try:
-                pdf_obj.multi_cell(0, height, txt=piece)
-            except Exception:
-                # try even smaller pieces (very defensive)
-                sub_start = 0
-                while sub_start < len(piece):
-                    sub_end = min(sub_start + 30, len(piece))
-                    sub_piece = piece[sub_start:sub_end]
-                    try:
-                        pdf_obj.multi_cell(0, height, txt=sub_piece)
-                    except Exception:
-                        # last resort: write single characters so it cannot fail
-                        for ch in sub_piece:
-                            try:
-                                pdf_obj.multi_cell(0, height, txt=ch)
-                            except Exception:
-                                # give up on this char (should be ASCII only already)
-                                continue
-                    sub_start = sub_end
-            start = end
+                # helper to defensively write a single logical "line" to pdf
+                def _write_line_defensively(pdf_obj, line: str, height=6, max_chunk=80):
+                """
+                Try to write `line` with multi_cell. If multi_cell raises because it can't
+                render a single character, split the line into smaller chunks and write them.
+                """
+                try:
+                    pdf_obj.multi_cell(0, height, txt=line)
+                    return
+                except Exception:
+                    # fallback: split into small chunks (max_chunk chars) and write each
+                    # ensure even smaller pieces if still failing
+                    start = 0
+                    L = len(line)
+                    while start < L:
+                        end = min(start + max_chunk, L)
+                        piece = line[start:end]
+                        try:
+                            pdf_obj.multi_cell(0, height, txt=piece)
+                        except Exception:
+                            # try even smaller pieces (very defensive)
+                            sub_start = 0
+                            while sub_start < len(piece):
+                                sub_end = min(sub_start + 30, len(piece))
+                                sub_piece = piece[sub_start:sub_end]
+                                try:
+                                    pdf_obj.multi_cell(0, height, txt=sub_piece)
+                                except Exception:
+                                    # last resort: write single characters so it cannot fail
+                                    for ch in sub_piece:
+                                        try:
+                                            pdf_obj.multi_cell(0, height, txt=ch)
+                                        except Exception:
+                                            # give up on this char (should be ASCII only already)
+                                            continue
+                                sub_start = sub_end
+                        start = end
 
-# write safe_text line-by-line, using the defensive writer
-for line in safe_text.splitlines():
-    if not line.strip():
-        fallback_pdf.ln(4)
-        continue
-    # also ensure we don't pass a super-long line to multi_cell
-    # split on existing spaces into chunks of <= 200 chars then write each with defensive writer
-    parts = []
-    cur = ""
-    for token in line.split(" "):
-        if len(cur) + 1 + len(token) <= 200:
-            cur = (cur + " " + token).strip()
-        else:
-            parts.append(cur)
-            cur = token
-    if cur:
-        parts.append(cur)
-    for p in parts:
-        _write_line_defensively(fallback_pdf, p, height=6, max_chunk=80)
+            # write safe_text line-by-line, using the defensive writer
+            for line in safe_text.splitlines():
+                if not line.strip():
+                    fallback_pdf.ln(4)
+                    continue
+                # also ensure we don't pass a super-long line to multi_cell
+                # split on existing spaces into chunks of <= 200 chars then write each with defensive writer
+                parts = []
+                cur = ""
+                for token in line.split(" "):
+                    if len(cur) + 1 + len(token) <= 200:
+                        cur = (cur + " " + token).strip()
+                    else:
+                        parts.append(cur)
+                        cur = token
+                if cur:
+                    parts.append(cur)
+                for p in parts:
+                    _write_line_defensively(fallback_pdf, p, height=6, max_chunk=80)
 
-# output fallback pdf
-fallback_pdf.output(fallback_buf)
-fallback_buf.seek(0)
-st.download_button(
-    "Download fallback .pdf",
-    fallback_buf,
-    file_name=f"{uploaded.name}_notes_ascii.pdf",
-    mime="application/pdf"
-)
+            # output fallback pdf
+            fallback_pdf.output(fallback_buf)
+            fallback_buf.seek(0)
+            st.download_button(
+                "Download fallback .pdf",
+                fallback_buf,
+                file_name=f"{uploaded.name}_notes_ascii.pdf",
+                mime="application/pdf"
+            )
 
 
 else:
