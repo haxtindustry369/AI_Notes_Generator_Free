@@ -1,4 +1,4 @@
-# app.py - Final robust free notes generator with unicode-safe PDF
+# app.py - Final robust free notes generator with unicode-safe PDF and sanitization
 import io
 import os
 import re
@@ -26,44 +26,41 @@ def _sentence_split(text):
     sents = re.split(r'(?<=[.!?])\s+', text.strip())
     return [s.strip() for s in sents if s.strip()]
 
-# break very long unbroken sequences so FPDF can wrap
 def _break_long_unbroken_sequences(text: str, max_len: int = 30) -> str:
     def _chunk(match):
         s = match.group(0)
         return " ".join(s[i:i+max_len] for i in range(0, len(s), max_len))
     return re.sub(r'\S{' + str(max_len) + r',}', _chunk, text)
 
-# safe-for-pdf: if unicode font not available, strip non-ascii
 def _make_safe_for_pdf(s: str, allow_unicode: bool) -> str:
     if allow_unicode:
         return s
     normalized = unicodedata.normalize("NFKD", s)
     ascii_bytes = normalized.encode("ascii", "ignore")
     return ascii_bytes.decode("ascii", "ignore")
-# -------------------------
-# Sanitize text for Unicode PDF: remove emojis/astral chars and control chars
-# -------------------------
-def _sanitize_for_unicode_pdf(text: str) -> str:
-    # Normalize
-    text = unicodedata.normalize("NFKC", text)
 
-    # Remove astral-plane chars (emojis / some rare symbols)
+# sanitize for unicode PDF: remove emojis/astral chars and control chars
+def _sanitize_for_unicode_pdf(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
     try:
         text = re.sub(r'[\U00010000-\U0010FFFF]', '', text)
     except re.error:
-        # fallback for narrow builds (shouldn't happen on modern Python)
+        # fallback for rare narrow builds
         text = re.sub(r'[\uD800-\uDBFF][\uDC00-\uDFFF]', '', text)
-
-    # Remove control characters except newline and tab
     text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
-
-    # Replace multiple spaces with single space
     text = re.sub(r'[ \t]{2,}', ' ', text)
-
     return text
 
+# more aggressive breaker utility used before any pdf write
+def _aggressive_prepare(text: str, unicode_allowed: bool, break_len: int = 60) -> str:
+    s = _make_safe_for_pdf(text, unicode_allowed)
+    s = _break_long_unbroken_sequences(s, max_len=break_len)
+    if unicode_allowed:
+        s = _sanitize_for_unicode_pdf(s)
+    return s
+
 # -------------------------
-# Extraction / summarization
+# Extraction / summarization (lightweight)
 # -------------------------
 def extract_text_from_pdf(file_stream):
     text_parts = []
@@ -298,7 +295,6 @@ if uploaded:
                     font_loaded = True
                     st.info(f"Using font: {font_path}")
                 else:
-                    # try by plain filename as last resort
                     pdf.add_font("DejaVu", "", font_filename, uni=True)
                     pdf.set_font("DejaVu", size=12)
                     font_loaded = True
@@ -308,41 +304,31 @@ if uploaded:
                 font_loaded = False
 
             try:
-                safe_summary = _make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n", font_loaded)
-                safe_summary = _break_long_unbroken_sequences(safe_summary, max_len=60)
-                safe_summary = _sanitize_for_unicode_pdf(safe_summary)  # <-- NEW
+                # Prepare and sanitize blocks for unicode path
+                safe_summary = _aggressive_prepare(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n", font_loaded, break_len=60)
                 pdf.multi_cell(0, 6, txt=safe_summary)
 
-
-                pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("MCQs:\n", font_loaded))
+                pdf.multi_cell(0, 6, txt=_aggressive_prepare("MCQs:\n", font_loaded, break_len=60))
                 for i, m in enumerate(mcqs, 1):
-                   qtxt = _make_safe_for_pdf(f"{i}. {m['question']}", font_loaded)
-                   qtxt = _break_long_unbroken_sequences(qtxt, max_len=60)
-                   qtxt = _sanitize_for_unicode_pdf(qtxt)   # <-- NEW
-                   pdf.multi_cell(0, 6, txt=qtxt)
-
-                   for oi, opt in enumerate(m['options']):
-                        opttxt = _make_safe_for_pdf(f"   {chr(65+oi)}. {opt}", font_loaded)
-                        opttxt = _break_long_unbroken_sequences(opttxt, max_len=60)
+                    qtxt = _aggressive_prepare(f"{i}. {m['question']}", font_loaded, break_len=60)
+                    pdf.multi_cell(0, 6, txt=qtxt)
+                    for oi, opt in enumerate(m['options']):
+                        opttxt = _aggressive_prepare(f"   {chr(65+oi)}. {opt}", font_loaded, break_len=60)
                         pdf.multi_cell(0, 6, txt=opttxt)
-                   ans_line = _make_safe_for_pdf(f"   Answer: {m['answer_text']}\n", font_loaded)
-                   pdf.multi_cell(0, 6, txt=ans_line)
+                    ans_line = _aggressive_prepare(f"   Answer: {m['answer_text']}\n", font_loaded, break_len=60)
+                    pdf.multi_cell(0, 6, txt=ans_line)
 
-                imp_block = _make_safe_for_pdf("\nImportant Questions:\n" + "\n".join(imp_qs) + "\n\n", font_loaded)
-                imp_block = _break_long_unbroken_sequences(imp_block, max_len=60)
+                imp_block = _aggressive_prepare("\nImportant Questions:\n" + "\n".join(imp_qs) + "\n\n", font_loaded, break_len=60)
                 pdf.multi_cell(0, 6, txt=imp_block)
 
-                pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("Short Answers:\n", font_loaded))
+                pdf.multi_cell(0, 6, txt=_aggressive_prepare("Short Answers:\n", font_loaded, break_len=60))
                 for i, p in enumerate(short_ans, 1):
-                    qline = _make_safe_for_pdf(f"Q{i}. {p['q']}", font_loaded)
-                    qline = _break_long_unbroken_sequences(qline, max_len=60)
+                    qline = _aggressive_prepare(f"Q{i}. {p['q']}", font_loaded, break_len=60)
                     pdf.multi_cell(0, 6, txt=qline)
-                    aline = _make_safe_for_pdf(f"A: {p['a']}\n", font_loaded)
-                    aline = _break_long_unbroken_sequences(aline, max_len=60)
+                    aline = _aggressive_prepare(f"A: {p['a']}\n", font_loaded, break_len=60)
                     pdf.multi_cell(0, 6, txt=aline)
 
-                prob_block = _make_safe_for_pdf("Most Probable Questions:\n" + "\n".join(probable), font_loaded)
-                prob_block = _break_long_unbroken_sequences(prob_block, max_len=60)
+                prob_block = _aggressive_prepare("Most Probable Questions:\n" + "\n".join(probable), font_loaded, break_len=60)
                 pdf.multi_cell(0, 6, txt=prob_block)
 
                 pdf.output(buf)
@@ -365,7 +351,6 @@ if uploaded:
                 safe_text = _make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n", False)
                 safe_text = _break_long_unbroken_sequences(safe_text, max_len=30)
 
-                # write defensively: split into parts and use multi_cell per part
                 for line in safe_text.splitlines():
                     if not line.strip():
                         fallback_pdf.ln(4)
@@ -381,7 +366,6 @@ if uploaded:
                     if cur:
                         parts.append(cur)
                     for p in parts:
-                        # write in safe chunks
                         start = 0
                         L = len(p)
                         while start < L:
@@ -390,7 +374,6 @@ if uploaded:
                             try:
                                 fallback_pdf.multi_cell(0, 6, txt=piece)
                             except Exception:
-                                # last resort: write char by char
                                 for ch in piece:
                                     try:
                                         fallback_pdf.multi_cell(0, 6, txt=ch)
