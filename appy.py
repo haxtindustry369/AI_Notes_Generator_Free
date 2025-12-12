@@ -40,6 +40,27 @@ def _make_safe_for_pdf(s: str, allow_unicode: bool) -> str:
     normalized = unicodedata.normalize("NFKD", s)
     ascii_bytes = normalized.encode("ascii", "ignore")
     return ascii_bytes.decode("ascii", "ignore")
+# -------------------------
+# Sanitize text for Unicode PDF: remove emojis/astral chars and control chars
+# -------------------------
+def _sanitize_for_unicode_pdf(text: str) -> str:
+    # Normalize
+    text = unicodedata.normalize("NFKC", text)
+
+    # Remove astral-plane chars (emojis / some rare symbols)
+    try:
+        text = re.sub(r'[\U00010000-\U0010FFFF]', '', text)
+    except re.error:
+        # fallback for narrow builds (shouldn't happen on modern Python)
+        text = re.sub(r'[\uD800-\uDBFF][\uDC00-\uDFFF]', '', text)
+
+    # Remove control characters except newline and tab
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+
+    # Replace multiple spaces with single space
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+
+    return text
 
 # -------------------------
 # Extraction / summarization
@@ -289,13 +310,17 @@ if uploaded:
             try:
                 safe_summary = _make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n", font_loaded)
                 safe_summary = _break_long_unbroken_sequences(safe_summary, max_len=60)
+                safe_summary = _sanitize_for_unicode_pdf(safe_summary)  # <-- NEW
                 pdf.multi_cell(0, 6, txt=safe_summary)
+
 
                 pdf.multi_cell(0, 6, txt=_make_safe_for_pdf("MCQs:\n", font_loaded))
                 for i, m in enumerate(mcqs, 1):
-                    qtxt = _make_safe_for_pdf(f"{i}. {m['question']}", font_loaded)
-                    qtxt = _break_long_unbroken_sequences(qtxt, max_len=60)
-                    pdf.multi_cell(0, 6, txt=qtxt)
+                   qtxt = _make_safe_for_pdf(f"{i}. {m['question']}", font_loaded)
+                   qtxt = _break_long_unbroken_sequences(qtxt, max_len=60)
+                   qtxt = _sanitize_for_unicode_pdf(qtxt)   # <-- NEW
+                   pdf.multi_cell(0, 6, txt=qtxt)
+
                     for oi, opt in enumerate(m['options']):
                         opttxt = _make_safe_for_pdf(f"   {chr(65+oi)}. {opt}", font_loaded)
                         opttxt = _break_long_unbroken_sequences(opttxt, max_len=60)
