@@ -22,6 +22,18 @@ def _make_safe_for_pdf(s: str, allow_unicode: bool) -> str:
     normalized = unicodedata.normalize("NFKD", s)
     ascii_bytes = normalized.encode("ascii", "ignore")
     return ascii_bytes.decode("ascii", "ignore")
+# helper: insert spaces into very long words so FPDF can wrap them
+def _break_long_unbroken_sequences(text: str, max_len: int = 60) -> str:
+    """
+    Insert a space every `max_len` characters inside any long sequence of
+    non-space characters to avoid FPDF "no horizontal space" errors.
+    """
+    # This will replace sequences of non-space characters longer than max_len
+    # with chunks separated by a space (so FPDF can break).
+    def _chunk(match):
+        s = match.group(0)
+        return " ".join(s[i:i+max_len] for i in range(0, len(s), max_len))
+    return re.sub(r'\S{' + str(max_len) + r',}', _chunk, text)
 
 # -------------------------
 # Simple stopwords + tokenizers (no external NLP libs)
@@ -311,15 +323,28 @@ if uploaded:
                     mime="application/pdf"
                 )
             except Exception:
-                # fallback ASCII-only pdf
+                # fallback ASCII-only pdf (robust)
                 st.error("PDF generation failed with Unicode font, creating simple ASCII PDF as fallback.")
                 fallback_buf = io.BytesIO()
                 fallback_pdf = FPDF()
                 fallback_pdf.add_page()
-                fallback_pdf.set_font("Arial", size=12)
+
+                # use a slightly smaller font for fallback to reduce space issues
+                fallback_pdf.set_font("Arial", size=10)
+
+                # prepare safe text: normalize and remove non-ascii
                 safe_text = _make_safe_for_pdf(f"AI Notes (FREE)\n\nSUMMARY:\n{summary}\n\n", False)
+                # ensure extremely long tokens are splitted so FPDF can wrap lines
+                safe_text = _break_long_unbroken_sequences(safe_text, max_len=60)
+
+                # write to pdf line-by-line (multi_cell can still wrap)
                 for line in safe_text.splitlines():
+                    # ensure each line itself isn't an empty large chunk
+                    if not line.strip():
+                       fallback_pdf.ln(4)
+                       continue
                     fallback_pdf.multi_cell(0, 6, txt=line)
+
                 fallback_pdf.output(fallback_buf)
                 fallback_buf.seek(0)
                 st.download_button(
@@ -328,6 +353,7 @@ if uploaded:
                     file_name=f"{uploaded.name}_notes_ascii.pdf",
                     mime="application/pdf"
                 )
+
 else:
     st.info("Upload a PDF or TXT file to start (free).")
 
